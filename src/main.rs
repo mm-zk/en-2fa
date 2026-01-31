@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     // --- Provider + wallet ---
     let provider = Provider::<Http>::try_from(args.en_rpc_url.as_str())
         .context("Failed to create provider (EN_RPC_URL)")?
-        .interval(Duration::from_millis(200));
+        .interval(Duration::from_millis(10000));
 
     let chain_id = provider
         .get_chainid()
