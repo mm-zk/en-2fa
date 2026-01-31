@@ -1,291 +1,238 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use tiny_keccak::{Hasher, Keccak};
+use dotenvy::dotenv;
+use ethers::abi::{ParamType, Token};
+use ethers::prelude::*;
+use ethers::types::{Address, Bytes, H256, U256};
+use std::str::FromStr;
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
+use tracing::{info, warn};
 
-use zksync_dal::ConnectionPool;
-use zksync_types::{
-    commitment::{L1BatchWithMetadata, PriorityOpsMerkleProof},
-    ethabi::{encode, Token},
-    Address, InteropRoot, ProtocolVersionId, U256,
-};
+mod db;
+use db::{BatchDb, PostgresBatchDb};
 
-// -----------------------------
-// You provided this snippet; it depends on these helpers.
-// In your repo, these are in some crate/module that exists in the zksync-era workspace.
-// In a standalone program, you have two choices:
-//   A) re-implement those helpers here (not recommended; easy to get wrong)
-//   B) depend on the crate that defines them and import the same paths.
-//
-// Below imports are placeholders; you MUST point them to where they live in your pinned tag.
-// Use `rg "get_encoding_version" -n` in your zksync-era checkout to find the right path.
-use crate::i_executor::structures::{get_encoding_version, StoredBatchInfo};
-// -----------------------------
+const CONTRACT_ADDR: &str = "0xE222D6354b49eaF8a7099fC4E7F9C0B4FE72d1E7";
 
-/// Input required to encode `executeBatches` call.
-#[derive(Debug, Clone)]
-pub struct ExecuteBatches {
-    pub l1_batches: Vec<L1BatchWithMetadata>,
-    pub priority_ops_proofs: Vec<PriorityOpsMerkleProof>,
-    pub dependency_roots: Vec<Vec<InteropRoot>>,
-}
-
-impl ExecuteBatches {
-    pub fn encode_for_eth_tx(&self, chain_protocol_version: ProtocolVersionId) -> Vec<Token> {
-        let internal_protocol_version = self.l1_batches[0].header.protocol_version.unwrap();
-
-        if internal_protocol_version.is_pre_gateway() && chain_protocol_version.is_pre_gateway() {
-            vec![Token::Array(
-                self.l1_batches
-                    .iter()
-                    .map(|batch| {
-                        StoredBatchInfo::from(batch)
-                            .into_token_with_protocol_version(internal_protocol_version)
-                    })
-                    .collect(),
-            )]
-        } else if internal_protocol_version.is_pre_interop_fast_blocks()
-            && chain_protocol_version.is_pre_interop_fast_blocks()
-        {
-            let encoded_data = encode(&[
-                Token::Array(
-                    self.l1_batches
-                        .iter()
-                        .map(|batch| {
-                            StoredBatchInfo::from(batch)
-                                .into_token_with_protocol_version(internal_protocol_version)
-                        })
-                        .collect(),
-                ),
-                Token::Array(
-                    self.priority_ops_proofs
-                        .iter()
-                        .map(|proof| proof.into_token())
-                        .collect(),
-                ),
-            ]);
-            let execute_data = [
-                [get_encoding_version(internal_protocol_version)].to_vec(),
-                encoded_data,
-            ]
-            .concat()
-            .to_vec();
-
-            vec![
-                Token::Uint(self.l1_batches[0].header.number.0.into()),
-                Token::Uint(self.l1_batches.last().unwrap().header.number.0.into()),
-                Token::Bytes(execute_data),
-            ]
-        } else {
-            let encoded_data = encode(&[
-                Token::Array(
-                    self.l1_batches
-                        .iter()
-                        .map(|batch| {
-                            StoredBatchInfo::from(batch)
-                                .into_token_with_protocol_version(internal_protocol_version)
-                        })
-                        .collect(),
-                ),
-                Token::Array(
-                    self.priority_ops_proofs
-                        .iter()
-                        .map(|proof| proof.into_token())
-                        .collect(),
-                ),
-                Token::Array(
-                    self.dependency_roots
-                        .iter()
-                        .map(|batch_roots| {
-                            Token::Array(
-                                batch_roots
-                                    .iter()
-                                    .map(|root| root.clone().into_token())
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                ),
-            ]);
-            let execute_data = [
-                [get_encoding_version(internal_protocol_version)].to_vec(),
-                encoded_data,
-            ]
-            .concat()
-            .to_vec();
-            vec![
-                Token::Uint(self.l1_batches[0].header.number.0.into()),
-                Token::Uint(self.l1_batches.last().unwrap().header.number.0.into()),
-                Token::Bytes(execute_data),
-            ]
-        }
-    }
-}
+abigen!(
+    ExecutionMultisigValidator,
+    r#"[
+        function approveHash(bytes32 _hash)
+        function individualApprovals(address signer, bytes32 hash) view returns (bool)
+        function executionMultisigMember(address signer) view returns (bool)
+        function totalApprovals(bytes32 hash) view returns (uint256)
+        function threshold() view returns (uint256)
+    ]"#
+);
 
 #[derive(Parser, Debug)]
+#[command(name="en-approvehash", about="Auto-approve zkSync batch execution hashes from EN DB")]
 struct Args {
-    /// Postgres connection string to the EN DB
+    /// External Node JSON-RPC URL
+    #[arg(long, env = "EN_RPC_URL", default_value = "http://127.0.0.1:3060")]
+    en_rpc_url: String,
+
+    /// Postgres connection string
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
 
-    /// L1 chain address to use as `_chainAddress` in hashing + calldata
-    /// (If you truly want DB-only, you can store this in env/compose and pass it here.)
-    #[arg(long)]
-    chain_address: String,
+    /// Private key hex string (0x...)
+    #[arg(long, env = "PK")]
+    pk: String,
 
-    /// First L1 batch number in the execution range
-    #[arg(long)]
-    from: u64,
+    /// Poll interval seconds
+    #[arg(long, env = "POLL_INTERVAL_SECS", default_value_t = 3)]
+    poll_interval_secs: u64,
 
-    /// Last L1 batch number in the execution range
-    #[arg(long)]
-    to: u64,
-
-    /// If not provided, we default to the internal protocol version from the first batch.
-    #[arg(long)]
-    chain_protocol_version: Option<u16>,
+    /// If true, do not send transactions
+    #[arg(long, env = "DRY_RUN", default_value_t = 0)]
+    dry_run: u8,
 }
 
-/// Keccak256 helper
-fn keccak256(data: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let mut k = Keccak::v256();
-    k.update(data);
-    k.finalize(&mut out);
-    out
-}
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenv().ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
+        .init();
 
-fn parse_address(s: &str) -> Result<Address> {
-    let s = s.trim();
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s).context("bad hex address")?;
-    if bytes.len() != 20 {
-        return Err(anyhow!("address must be 20 bytes"));
+    let args = Args::parse();
+
+    // --- Provider + wallet ---
+    let provider = Provider::<Http>::try_from(args.en_rpc_url.as_str())
+        .context("Failed to create provider (EN_RPC_URL)")?
+        .interval(Duration::from_millis(200));
+
+    let chain_id = provider
+        .get_chainid()
+        .await
+        .context("Failed to fetch chain id")?
+        .as_u64();
+
+    let wallet: LocalWallet = args
+        .pk
+        .parse::<LocalWallet>()
+        .context("Failed to parse PK as a local wallet")?
+        .with_chain_id(chain_id);
+
+    let signer_addr = wallet.address();
+    info!(%chain_id, %signer_addr, "Signer ready");
+
+    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet));
+    let contract_addr = Address::from_str(CONTRACT_ADDR).context("Bad CONTRACT_ADDR")?;
+    let contract = ExecutionMultisigValidator::new(contract_addr, client.clone());
+
+    // --- Basic contract sanity checks ---
+    let is_member = contract
+        .execution_multisig_member(signer_addr)
+        .call()
+        .await
+        .context("Failed to read executionMultisigMember")?;
+
+    if !is_member {
+        return Err(anyhow!(
+            "Signer {} is not an executionMultisigMember; approveHash would revert NotSigner()",
+            signer_addr
+        ));
     }
-    Ok(Address::from_slice(&bytes))
+
+    let threshold = contract.threshold().call().await.unwrap_or_default();
+    info!(%threshold, "Contract threshold read");
+
+    // --- DB ---
+    let pool = sqlx::PgPool::connect(&args.database_url)
+        .await
+        .context("Failed to connect to Postgres (DATABASE_URL)")?;
+    let db = PostgresBatchDb::new(pool);
+
+    let mut last_seen_batch: i64 = 0;
+
+    loop {
+        match db.fetch_next_ready_execute_call(last_seen_batch).await? {
+            None => {
+                sleep(Duration::from_secs(args.poll_interval_secs)).await;
+                continue;
+            }
+            Some(ready) => {
+                info!(batch=%ready.l1_batch_number, "Found batch with prepared execute calldata");
+
+                // Decode execute calldata => (chainAddress, from, to, batchData)
+                let (chain_addr, from_batch, to_batch, batch_data) =
+                    decode_execute_batches_shared_bridge(&ready.execute_calldata)
+                        .context("Failed to decode execute calldata (adjust signature/decoder if needed)")?;
+
+                // keccak256(abi.encode(chainAddress, from, to, batchData))
+                let approved_hash = solidity_abi_encode_and_keccak(chain_addr, from_batch, to_batch, &batch_data);
+
+                // check already signed
+                let already = contract
+                    .individual_approvals(signer_addr, approved_hash.into())
+                    .call()
+                    .await
+                    .context("Failed to read individualApprovals")?;
+
+                if already {
+                    info!(batch=%ready.l1_batch_number, hash=%approved_hash, "Already approved; skipping");
+                    last_seen_batch = ready.l1_batch_number;
+                    continue;
+                }
+
+                info!(
+                    batch=%ready.l1_batch_number,
+                    chain=%chain_addr,
+                    from=%from_batch,
+                    to=%to_batch,
+                    hash=%approved_hash,
+                    data_len=batch_data.0.len(),
+                    "Approving hash"
+                );
+
+                if args.dry_run == 1 {
+                    warn!("DRY_RUN=1; not sending tx");
+                    last_seen_batch = ready.l1_batch_number;
+                    continue;
+                }
+
+                let call = contract.approve_hash(approved_hash.into());
+                let pending = call
+                    .send()
+                    .await
+                    .context("Failed to send approveHash tx")?;
+
+                let receipt = pending
+                    .await
+                    .context("Failed while awaiting receipt")?
+                    .ok_or_else(|| anyhow!("Tx dropped from mempool / no receipt"))?;
+
+                info!(
+                    tx=%receipt.transaction_hash,
+                    status=?receipt.status,
+                    batch=%ready.l1_batch_number,
+                    "approveHash mined"
+                );
+
+                last_seen_batch = ready.l1_batch_number;
+            }
+        }
+
+        sleep(Duration::from_secs(args.poll_interval_secs)).await;
+    }
 }
 
-/// Build calldata for executeBatchesSharedBridge(address,uint256,uint256,bytes)
-fn build_execute_shared_bridge_calldata(chain: Address, from: u64, to: u64, batch_data: Vec<u8>) -> Vec<u8> {
-    let selector = &keccak256(b"executeBatchesSharedBridge(address,uint256,uint256,bytes)")[0..4];
-    let encoded_args = encode(&[
-        Token::Address(chain),
-        Token::Uint(U256::from(from)),
-        Token::Uint(U256::from(to)),
-        Token::Bytes(batch_data),
-    ]);
-    [selector.to_vec(), encoded_args].concat()
+/// Decode calldata for: executeBatchesSharedBridge(address,uint256,uint256,bytes)
+///
+/// Layout:
+/// 4 bytes selector + ABI-encoded args
+fn decode_execute_batches_shared_bridge(calldata: &[u8]) -> Result<(Address, U256, U256, Bytes)> {
+    if calldata.len() < 4 {
+        return Err(anyhow!("calldata too short"));
+    }
+
+    // Function selector is first 4 bytes; we don't strictly require it to match, but you can add a check.
+    let args = &calldata[4..];
+
+    // Decode (address,uint256,uint256,bytes)
+    let tokens = ethers::abi::decode(
+        &[
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Uint(256),
+            ParamType::Bytes,
+        ],
+        args,
+    )
+    .context("ABI decode failed")?;
+
+    let chain = match &tokens[0] {
+        Token::Address(a) => *a,
+        _ => return Err(anyhow!("bad token[0]")),
+    };
+    let from = match &tokens[1] {
+        Token::Uint(u) => *u,
+        _ => return Err(anyhow!("bad token[1]")),
+    };
+    let to = match &tokens[2] {
+        Token::Uint(u) => *u,
+        _ => return Err(anyhow!("bad token[2]")),
+    };
+    let data = match &tokens[3] {
+        Token::Bytes(b) => Bytes::from(b.clone()),
+        _ => return Err(anyhow!("bad token[3]")),
+    };
+
+    Ok((chain, from, to, data))
 }
 
-/// approvedHash = keccak256(abi.encode(chainAddress, from, to, batchData))
-fn approved_hash(chain: Address, from: u64, to: u64, batch_data: Vec<u8>) -> [u8; 32] {
+/// Mimic Solidity: keccak256(abi.encode(address,uint256,uint256,bytes))
+fn solidity_abi_encode_and_keccak(chain: Address, from: U256, to: U256, data: &Bytes) -> H256 {
+    use ethers::abi::encode;
+
     let encoded = encode(&[
         Token::Address(chain),
-        Token::Uint(U256::from(from)),
-        Token::Uint(U256::from(to)),
-        Token::Bytes(batch_data),
+        Token::Uint(from),
+        Token::Uint(to),
+        Token::Bytes(data.to_vec()),
     ]);
-    keccak256(&encoded)
-}
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    let chain_address = parse_address(&args.chain_address)?;
-
-    // Connect to DB using the same DAL the node uses (stable vs raw SQL).
-    let pool = ConnectionPool::builder(args.database_url.clone())
-        .build()
-        .await
-        .context("failed to build ConnectionPool")?;
-
-    let mut conn = pool.connection().await.context("failed to get DB connection")?;
-
-    // -----------------------------
-    // Fetch execution inputs from DB
-    //
-    // These DAL method names can differ across tags.
-    // If you get a compile error "method not found", search in your pinned tag:
-    //   rg "L1BatchWithMetadata" core/lib/dal -n
-    //   rg "PriorityOpsMerkleProof" core/lib/dal -n
-    //   rg "InteropRoot" core/lib/dal -n
-    // and update the calls accordingly.
-    // -----------------------------
-
-    let mut l1_batches: Vec<L1BatchWithMetadata> = Vec::new();
-    let mut proofs: Vec<PriorityOpsMerkleProof> = Vec::new();
-    let mut dependency_roots: Vec<Vec<InteropRoot>> = Vec::new();
-
-    for number in args.from..=args.to {
-        // 1) batch + metadata
-        let batch: L1BatchWithMetadata = conn
-            .blocks_dal()
-            .get_l1_batch_with_metadata(number)
-            .await
-            .with_context(|| format!("get_l1_batch_with_metadata({number})"))?;
-        l1_batches.push(batch);
-
-        // 2) priority ops merkle proof
-        let proof: PriorityOpsMerkleProof = conn
-            .blocks_dal()
-            .get_priority_ops_merkle_proof(number)
-            .await
-            .with_context(|| format!("get_priority_ops_merkle_proof({number})"))?;
-        proofs.push(proof);
-
-        // 3) dependency roots (may be empty for older protocol versions)
-        let roots: Vec<InteropRoot> = conn
-            .blocks_dal()
-            .get_interop_roots(number)
-            .await
-            .unwrap_or_default();
-        dependency_roots.push(roots);
-    }
-
-    if l1_batches.is_empty() {
-        return Err(anyhow!("no batches loaded"));
-    }
-
-    // Protocol version selection:
-    // - internal: comes from batch header (used inside encode_for_eth_tx)
-    // - chain_protocol_version: if not provided, default to internal (works in most setups)
-    let internal_pv = l1_batches[0]
-        .header
-        .protocol_version
-        .ok_or_else(|| anyhow!("first batch has no protocol_version in header"))?;
-
-    let chain_pv = if let Some(v) = args.chain_protocol_version {
-        ProtocolVersionId::try_from(v as u16)
-            .map_err(|_| anyhow!("invalid chain_protocol_version={v}"))?
-    } else {
-        internal_pv
-    };
-
-    let execute = ExecuteBatches {
-        l1_batches,
-        priority_ops_proofs: proofs,
-        dependency_roots,
-    };
-
-    // Your snippet returns (from,to,bytes) in most modern branches; we take the bytes as `_batchData`.
-    let tokens = execute.encode_for_eth_tx(chain_pv);
-
-    let (process_from, process_to, batch_data) = match tokens.as_slice() {
-        [Token::Uint(f), Token::Uint(t), Token::Bytes(b)] => (f.as_u64(), t.as_u64(), b.clone()),
-        // very old encoding variant returns just an array; in that case batchData is the ABI-encoding of that token list
-        _ => {
-            let batch_data = encode(&tokens);
-            (args.from, args.to, batch_data)
-        }
-    };
-
-    let hash = approved_hash(chain_address, process_from, process_to, batch_data.clone());
-    let calldata = build_execute_shared_bridge_calldata(chain_address, process_from, process_to, batch_data.clone());
-
-    println!("processBatchFrom : {}", process_from);
-    println!("processBatchTo   : {}", process_to);
-    println!("batchData        : 0x{}", hex::encode(&batch_data));
-    println!("approvedHash     : 0x{}", hex::encode(hash));
-    println!("execute calldata : 0x{}", hex::encode(calldata));
-
-    Ok(())
+    H256::from(ethers::utils::keccak256(encoded))
 }
