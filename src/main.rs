@@ -26,11 +26,14 @@ abigen!(
 );
 
 #[derive(Parser, Debug)]
-#[command(name="en-approvehash", about="Auto-approve zkSync batch execution hashes from EN DB")]
+#[command(
+    name = "en-approvehash",
+    about = "Auto-approve zkSync batch execution hashes from EN DB (tx sent on Ethereum mainnet)"
+)]
 struct Args {
-    /// External Node JSON-RPC URL
-    #[arg(long, env = "EN_RPC_URL", default_value = "http://127.0.0.1:3060")]
-    en_rpc_url: String,
+    /// Ethereum mainnet JSON-RPC URL (for contract calls + sending tx)
+    #[arg(long, env = "ETH_RPC_URL")]
+    eth_rpc_url: String,
 
     /// Postgres connection string
     #[arg(long, env = "DATABASE_URL")]
@@ -58,16 +61,23 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // --- Provider + wallet ---
-    let provider = Provider::<Http>::try_from(args.en_rpc_url.as_str())
-        .context("Failed to create provider (EN_RPC_URL)")?
-        .interval(Duration::from_millis(10000));
+    // --- Ethereum mainnet provider + wallet (ALL contract calls go here) ---
+    let eth_provider = Provider::<Http>::try_from(args.eth_rpc_url.as_str())
+        .context("Failed to create provider (ETH_RPC_URL)")?
+        .interval(Duration::from_millis(200));
 
-    let chain_id = provider
+    let chain_id = eth_provider
         .get_chainid()
         .await
-        .context("Failed to fetch chain id")?
+        .context("Failed to fetch Ethereum chain id")?
         .as_u64();
+
+    if chain_id != 1 {
+        return Err(anyhow!(
+            "ETH_RPC_URL is not Ethereum mainnet (chain_id={})",
+            chain_id
+        ));
+    }
 
     let wallet: LocalWallet = args
         .pk
@@ -76,13 +86,13 @@ async fn main() -> Result<()> {
         .with_chain_id(chain_id);
 
     let signer_addr = wallet.address();
-    info!(%chain_id, %signer_addr, "Signer ready");
+    info!(%chain_id, %signer_addr, "Ethereum signer ready");
 
-    let client = Arc::new(SignerMiddleware::new(provider.clone(), wallet));
+    let client = Arc::new(SignerMiddleware::new(eth_provider.clone(), wallet));
     let contract_addr = Address::from_str(CONTRACT_ADDR).context("Bad CONTRACT_ADDR")?;
     let contract = ExecutionMultisigValidator::new(contract_addr, client.clone());
 
-    // --- Basic contract sanity checks ---
+    // --- Basic contract sanity checks (on Ethereum mainnet) ---
     let is_member = contract
         .execution_multisig_member(signer_addr)
         .call()
@@ -99,7 +109,7 @@ async fn main() -> Result<()> {
     let threshold = contract.threshold().call().await.unwrap_or_default();
     info!(%threshold, "Contract threshold read");
 
-    // --- DB ---
+    // --- DB (External Node Postgres) ---
     let pool = sqlx::PgPool::connect(&args.database_url)
         .await
         .context("Failed to connect to Postgres (DATABASE_URL)")?;
@@ -124,7 +134,7 @@ async fn main() -> Result<()> {
                 // keccak256(abi.encode(chainAddress, from, to, batchData))
                 let approved_hash = solidity_abi_encode_and_keccak(chain_addr, from_batch, to_batch, &batch_data);
 
-                // check already signed
+                // check already signed (on Ethereum mainnet)
                 let already = contract
                     .individual_approvals(signer_addr, approved_hash.into())
                     .call()
@@ -144,7 +154,7 @@ async fn main() -> Result<()> {
                     to=%to_batch,
                     hash=%approved_hash,
                     data_len=batch_data.0.len(),
-                    "Approving hash"
+                    "Approving hash (tx on Ethereum mainnet)"
                 );
 
                 if args.dry_run == 1 {
@@ -153,6 +163,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // avoid temporary-lifetime issue: bind call first
                 let call = contract.approve_hash(approved_hash.into());
                 let pending = call
                     .send()
@@ -188,7 +199,7 @@ fn decode_execute_batches_shared_bridge(calldata: &[u8]) -> Result<(Address, U25
         return Err(anyhow!("calldata too short"));
     }
 
-    // Function selector is first 4 bytes; we don't strictly require it to match, but you can add a check.
+    // Function selector is first 4 bytes
     let args = &calldata[4..];
 
     // Decode (address,uint256,uint256,bytes)
