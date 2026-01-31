@@ -811,7 +811,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "en-approvehash"
+name = "en-2fa"
 version = "0.1.0"
 dependencies = [
  "anyhow",
