@@ -1,0 +1,18 @@
+[package]
+name = "en-2fa"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tiny-keccak = "2"
+
+# Pin to the same zksync-era core tag as your docker images!
+zksync_dal = { git = "https://github.com/matter-labs/zksync-era", tag = "core-v29.7.1", package = "zksync_dal" }
+zksync_types = { git = "https://github.com/matter-labs/zksync-era", tag = "core-v29.7.1", package = "zksync_types" }
+
+# If your encoding helpers live in a different crate in your checkout,
+# add that crate here similarly (see notes below).
