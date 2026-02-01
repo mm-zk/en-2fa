@@ -4,8 +4,8 @@ use dotenvy::dotenv;
 use ethers::abi::Token;
 use ethers::prelude::*;
 use ethers::types::{Address, Bytes, H256, U256};
-use std::str::FromStr;
 use std::collections::VecDeque;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
@@ -64,13 +64,19 @@ struct Args {
     /// Priority tree start index (post-gateway). If not provided, proofs will be defaulted.
     #[arg(long, env = "PRIORITY_TREE_START_INDEX")]
     priority_tree_start_index: Option<usize>,
+
+    /// If set, run only one batch with this L1 batch number and exit.
+    #[arg(long)]
+    run_one_batch: Option<u64>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
+        )
         .init();
 
     let args = Args::parse();
@@ -101,6 +107,7 @@ async fn main() -> Result<()> {
 
     let signer_addr = wallet.address();
     info!(%chain_id, %signer_addr, "Ethereum signer ready");
+    println!("here!");
 
     let client = Arc::new(SignerMiddleware::new(eth_provider.clone(), wallet));
     let contract_addr = Address::from_str(CONTRACT_ADDR).context("Bad CONTRACT_ADDR")?;
@@ -113,13 +120,18 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to read executionMultisigMember")?;
 
-    // TODO: restore after testing
-    // if !is_member {
-    //     return Err(anyhow!(
-    //         "Signer {} is not an executionMultisigMember; approveHash would revert NotSigner()",
-    //         signer_addr
-    //     ));
-    // }
+    if !is_member {
+        warn!(
+            "Signer {} is NOT an executionMultisigMember; approveHash would revert NotSigner()",
+            signer_addr
+        );
+        // TODO: restore after testing
+
+        //     return Err(anyhow!(
+        //         "Signer {} is not an executionMultisigMember; approveHash would revert NotSigner()",
+        //         signer_addr
+        //     ));
+    }
 
     let threshold = contract.threshold().call().await.unwrap_or_default();
     info!(%threshold, "Contract threshold read");
@@ -132,6 +144,23 @@ async fn main() -> Result<()> {
         .context("Failed to connect to Postgres (DATABASE_URL)")?;
     let db = PostgresBatchDb::new(pool.clone());
 
+    // Running just a single batch manually (mostly for testing).
+    if let Some(run_one_batch) = args.run_one_batch {
+        info!(batch=%run_one_batch, "Running single batch as requested; exiting after");
+        run_single_batch(
+            pool.clone(),
+            run_one_batch as i64,
+            chain_address,
+            &args,
+            contract.clone(),
+            signer_addr,
+        )
+        .await
+        .with_context(|| format!("run_single_batch for L1 batch {}", run_one_batch))?;
+        return Ok(());
+    }
+
+    // Automatic looping mode.
     let mut last_seen_batch: i64 = 0;
 
     loop {
@@ -143,73 +172,18 @@ async fn main() -> Result<()> {
             Some(ready) => {
                 info!(batch=%ready.l1_batch_number, "Found batch ready for execute; building calldata");
 
-                let (from_batch, to_batch, batch_data) = build_execute_batches_data(
+                run_single_batch(
                     pool.clone(),
-                    ready.l1_batch_number as u32,
-                    args.priority_tree_start_index,
-                    args.chain_protocol_version,
+                    ready.l1_batch_number,
+                    chain_address,
+                    &args,
+                    contract.clone(),
+                    signer_addr,
                 )
                 .await
-                .context("Failed to build executeBatchesSharedBridge data")?;
-
-                let _calldata = build_execute_shared_bridge_calldata(
-                    chain_address,
-                    from_batch.as_u64(),
-                    to_batch.as_u64(),
-                    batch_data.clone(),
-                );
-
-                // keccak256(abi.encode(chainAddress, from, to, batchData))
-                let approved_hash =
-                    solidity_abi_encode_and_keccak(chain_address, from_batch, to_batch, &batch_data);
-
-                // check already signed (on Ethereum mainnet)
-                let already = contract
-                    .individual_approvals(signer_addr, approved_hash.into())
-                    .call()
-                    .await
-                    .context("Failed to read individualApprovals")?;
-
-                if already {
-                    info!(batch=%ready.l1_batch_number, hash=%approved_hash, "Already approved; skipping");
-                    last_seen_batch = ready.l1_batch_number;
-                    continue;
-                }
-
-                info!(
-                    batch=%ready.l1_batch_number,
-                    chain=%chain_address,
-                    from=%from_batch,
-                    to=%to_batch,
-                    hash=%approved_hash,
-                    data_len=batch_data.0.len(),
-                    "Approving hash (tx on Ethereum mainnet)"
-                );
-
-                if args.dry_run == 1 {
-                    warn!("DRY_RUN=1; not sending tx");
-                    last_seen_batch = ready.l1_batch_number;
-                    continue;
-                }
-
-                // avoid temporary-lifetime issue: bind call first
-                let call = contract.approve_hash(approved_hash.into());
-                let pending = call
-                    .send()
-                    .await
-                    .context("Failed to send approveHash tx")?;
-
-                let receipt = pending
-                    .await
-                    .context("Failed while awaiting receipt")?
-                    .ok_or_else(|| anyhow!("Tx dropped from mempool / no receipt"))?;
-
-                info!(
-                    tx=%receipt.transaction_hash,
-                    status=?receipt.status,
-                    batch=%ready.l1_batch_number,
-                    "approveHash mined"
-                );
+                .with_context(|| {
+                    format!("run_single_batch for L1 batch {}", ready.l1_batch_number)
+                })?;
 
                 last_seen_batch = ready.l1_batch_number;
             }
@@ -217,6 +191,79 @@ async fn main() -> Result<()> {
 
         sleep(Duration::from_secs(args.poll_interval_secs)).await;
     }
+}
+
+async fn run_single_batch(
+    pool: PgPool,
+    l1_batch_number: i64,
+    chain_address: Address,
+    args: &Args,
+    contract: ExecutionMultisigValidator<SignerMiddleware<Provider<Http>, LocalWallet>>,
+    signer_addr: Address,
+) -> Result<()> {
+    let (from_batch, to_batch, batch_data) = build_execute_batches_data(
+        pool,
+        l1_batch_number as u32,
+        args.priority_tree_start_index,
+        args.chain_protocol_version,
+    )
+    .await
+    .context("Failed to build executeBatchesSharedBridge data")?;
+
+    let _calldata = build_execute_shared_bridge_calldata(
+        chain_address,
+        from_batch.as_u64(),
+        to_batch.as_u64(),
+        batch_data.clone(),
+    );
+
+    // keccak256(abi.encode(chainAddress, from, to, batchData))
+    let approved_hash =
+        solidity_abi_encode_and_keccak(chain_address, from_batch, to_batch, &batch_data);
+
+    // check already signed (on Ethereum mainnet)
+    let already = contract
+        .individual_approvals(signer_addr, approved_hash.into())
+        .call()
+        .await
+        .context("Failed to read individualApprovals")?;
+
+    if already {
+        info!(batch=%l1_batch_number, hash=%approved_hash, "Already approved; skipping");
+        return Ok(());
+    }
+
+    info!(
+        batch=%l1_batch_number,
+        chain=%chain_address,
+        from=%from_batch,
+        to=%to_batch,
+        hash=%approved_hash,
+        data_len=batch_data.0.len(),
+        "Approving hash (tx on Ethereum mainnet)"
+    );
+
+    if args.dry_run == 1 {
+        warn!("DRY_RUN=1; not sending tx");
+        return Ok(());
+    }
+
+    // avoid temporary-lifetime issue: bind call first
+    let call = contract.approve_hash(approved_hash.into());
+    let pending = call.send().await.context("Failed to send approveHash tx")?;
+
+    let receipt = pending
+        .await
+        .context("Failed while awaiting receipt")?
+        .ok_or_else(|| anyhow!("Tx dropped from mempool / no receipt"))?;
+
+    info!(
+        tx=%receipt.transaction_hash,
+        status=?receipt.status,
+        batch=%l1_batch_number,
+        "approveHash mined"
+    );
+    Ok(())
 }
 
 fn parse_address(s: &str) -> Result<Address> {
@@ -236,7 +283,9 @@ fn build_execute_shared_bridge_calldata(
     to: u64,
     batch_data: Bytes,
 ) -> Vec<u8> {
-    let selector = &ethers::utils::keccak256(b"executeBatchesSharedBridge(address,uint256,uint256,bytes)")[0..4];
+    let selector =
+        &ethers::utils::keccak256(b"executeBatchesSharedBridge(address,uint256,uint256,bytes)")
+            [0..4];
     let encoded_args = ethers::abi::encode(&[
         Token::Address(chain),
         Token::Uint(U256::from(from)),
@@ -326,11 +375,10 @@ async fn build_priority_ops_proofs(
 
     let mut priority_ops_proofs = Vec::with_capacity(l1_batches.len());
     for batch in l1_batches {
-        let first_priority_op_id_option =
-            get_batch_first_priority_op_id(pool, batch.header.number)
-                .await
-                .context("get_batch_first_priority_op_id")?
-                .filter(|id| *id >= priority_tree_start_index);
+        let first_priority_op_id_option = get_batch_first_priority_op_id(pool, batch.header.number)
+            .await
+            .context("get_batch_first_priority_op_id")?
+            .filter(|id| *id >= priority_tree_start_index);
 
         let count = batch.header.l1_tx_count as usize;
         if count == 0 || first_priority_op_id_option.is_none() {
@@ -339,10 +387,12 @@ async fn build_priority_ops_proofs(
         }
 
         let first_priority_op_id_in_batch = first_priority_op_id_option.unwrap();
-        let new_l1_tx_hashes =
-            get_l1_transactions_hashes(pool, priority_tree_start_index + priority_merkle_tree.length())
-                .await
-                .context("get_l1_transactions_hashes for update")?;
+        let new_l1_tx_hashes = get_l1_transactions_hashes(
+            pool,
+            priority_tree_start_index + priority_merkle_tree.length(),
+        )
+        .await
+        .context("get_l1_transactions_hashes for update")?;
 
         for hash in new_l1_tx_hashes {
             priority_merkle_tree.push_hash(hash);
@@ -536,9 +586,12 @@ impl ExecuteBatches {
                         .collect(),
                 ),
             ]);
-            let execute_data = [[get_encoding_version(internal_protocol_version)].to_vec(), encoded_data]
-                .concat()
-                .to_vec();
+            let execute_data = [
+                [get_encoding_version(internal_protocol_version)].to_vec(),
+                encoded_data,
+            ]
+            .concat()
+            .to_vec();
 
             vec![
                 Token::Uint(self.l1_batches[0].header.number.into()),
@@ -577,9 +630,12 @@ impl ExecuteBatches {
                         .collect(),
                 ),
             ]);
-            let execute_data = [[get_encoding_version(internal_protocol_version)].to_vec(), encoded_data]
-                .concat()
-                .to_vec();
+            let execute_data = [
+                [get_encoding_version(internal_protocol_version)].to_vec(),
+                encoded_data,
+            ]
+            .concat()
+            .to_vec();
             vec![
                 Token::Uint(self.l1_batches[0].header.number.into()),
                 Token::Uint(self.l1_batches.last().unwrap().header.number.into()),
@@ -646,7 +702,10 @@ fn extract_dependency_roots_rolling_hash(system_logs: &[Vec<u8>]) -> Option<H256
     None
 }
 
-async fn load_l1_batch_with_metadata(pool: &PgPool, batch_number: u32) -> Result<L1BatchWithMetadata> {
+async fn load_l1_batch_with_metadata(
+    pool: &PgPool,
+    batch_number: u32,
+) -> Result<L1BatchWithMetadata> {
     let row = sqlx::query(
         r#"
         SELECT
@@ -687,7 +746,10 @@ async fn load_l1_batch_with_metadata(pool: &PgPool, batch_number: u32) -> Result
     let mut priority_ops_hashes = Vec::with_capacity(priority_ops_onchain_data.len());
     for data in priority_ops_onchain_data {
         if data.len() != 64 {
-            return Err(anyhow!("priority_ops_onchain_data entry has bad length {}", data.len()));
+            return Err(anyhow!(
+                "priority_ops_onchain_data entry has bad length {}",
+                data.len()
+            ));
         }
         priority_ops_hashes.push(H256::from_slice(&data[32..64]));
     }
@@ -703,8 +765,12 @@ async fn load_l1_batch_with_metadata(pool: &PgPool, batch_number: u32) -> Result
 
     let metadata = L1BatchMetadata {
         root_hash: H256::from_slice(&hash.ok_or_else(|| anyhow!("missing batch hash"))?),
-        rollup_last_leaf_index: rollup_last_leaf_index.ok_or_else(|| anyhow!("missing rollup_last_leaf_index"))? as u64,
-        l2_l1_merkle_root: H256::from_slice(&l2_l1_merkle_root.ok_or_else(|| anyhow!("missing l2_l1_merkle_root"))?),
+        rollup_last_leaf_index: rollup_last_leaf_index
+            .ok_or_else(|| anyhow!("missing rollup_last_leaf_index"))?
+            as u64,
+        l2_l1_merkle_root: H256::from_slice(
+            &l2_l1_merkle_root.ok_or_else(|| anyhow!("missing l2_l1_merkle_root"))?,
+        ),
         commitment: H256::from_slice(&commitment.ok_or_else(|| anyhow!("missing commitment"))?),
     };
 
