@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use dotenvy::dotenv;
-use ethers::abi::Token;
+use ethers::abi::{ParamType, Token};
 use ethers::prelude::*;
 use ethers::types::{Address, Bytes, H256, U256};
 use std::collections::VecDeque;
@@ -14,7 +14,12 @@ mod db;
 use db::{BatchDb, PostgresBatchDb};
 use sqlx::{PgPool, Row};
 
+use crate::utils::get_priority_op_merkle_path;
+mod utils;
+
 const CONTRACT_ADDR: &str = "0xE222D6354b49eaF8a7099fC4E7F9C0B4FE72d1E7";
+
+const SAMPLE_TX: &str = "0xb4c1ea93f17e77cdbf6c47868e7727c18917eff489e626b8f8c4ab121a8438d6";
 
 abigen!(
     ExecutionMultisigValidator,
@@ -24,6 +29,7 @@ abigen!(
         function executionMultisigMember(address signer) view returns (bool)
         function totalApprovals(bytes32 hash) view returns (uint256)
         function threshold() view returns (uint256)
+        function executeBatchesSharedBridge(address _chainAddress, uint256 _processBatchFrom, uint256 _processBatchTo, bytes calldata _batchData) 
     ]"#
 );
 
@@ -61,10 +67,6 @@ struct Args {
     #[arg(long, env = "CHAIN_PROTOCOL_VERSION")]
     chain_protocol_version: Option<u16>,
 
-    /// Priority tree start index (post-gateway). If not provided, proofs will be defaulted.
-    #[arg(long, env = "PRIORITY_TREE_START_INDEX")]
-    priority_tree_start_index: Option<usize>,
-
     /// If set, run only one batch with this L1 batch number and exit.
     #[arg(long)]
     run_one_batch: Option<u64>,
@@ -85,6 +87,8 @@ async fn main() -> Result<()> {
     let eth_provider = Provider::<Http>::try_from(args.eth_rpc_url.as_str())
         .context("Failed to create provider (ETH_RPC_URL)")?
         .interval(Duration::from_millis(200));
+
+    // Get the calldata from SAMPLE_TX, and parse it as ExecuteBatches
 
     let chain_id = eth_provider
         .get_chainid()
@@ -144,6 +148,21 @@ async fn main() -> Result<()> {
         .context("Failed to connect to Postgres (DATABASE_URL)")?;
     let db = PostgresBatchDb::new(pool.clone());
 
+    let (batch_number, proof) = get_priority_op_merkle_path(args.eth_rpc_url.as_str(), SAMPLE_TX)
+        .await
+        .unwrap();
+
+    let first_priority_op_id = get_batch_first_priority_op_id(&pool.clone(), batch_number.as_u32())
+        .await
+        .context("get_batch_first_priority_op_id")?
+        .unwrap();
+
+    let initial_mini_merkle_tree = MiniMerkleTree::from_start_index_and_proof(
+        //first_priority_op_id.checked_sub(1).unwrap(),
+        first_priority_op_id,
+        proof,
+    );
+
     // Running just a single batch manually (mostly for testing).
     if let Some(run_one_batch) = args.run_one_batch {
         info!(batch=%run_one_batch, "Running single batch as requested; exiting after");
@@ -154,6 +173,7 @@ async fn main() -> Result<()> {
             &args,
             contract.clone(),
             signer_addr,
+            initial_mini_merkle_tree,
         )
         .await
         .with_context(|| format!("run_single_batch for L1 batch {}", run_one_batch))?;
@@ -179,6 +199,7 @@ async fn main() -> Result<()> {
                     &args,
                     contract.clone(),
                     signer_addr,
+                    initial_mini_merkle_tree.clone(),
                 )
                 .await
                 .with_context(|| {
@@ -200,15 +221,23 @@ async fn run_single_batch(
     args: &Args,
     contract: ExecutionMultisigValidator<SignerMiddleware<Provider<Http>, LocalWallet>>,
     signer_addr: Address,
+    initial_mini_merkle_tree: MiniMerkleTree,
 ) -> Result<()> {
     let (from_batch, to_batch, batch_data) = build_execute_batches_data(
         pool,
         l1_batch_number as u32,
-        args.priority_tree_start_index,
+        initial_mini_merkle_tree.clone(),
         args.chain_protocol_version,
     )
     .await
     .context("Failed to build executeBatchesSharedBridge data")?;
+
+    // Print batch data as hex for debugging.
+    println!(
+        "Batch data (len={}): 0x{}",
+        batch_data.0.len(),
+        hex::encode(&batch_data.0)
+    );
 
     let _calldata = build_execute_shared_bridge_calldata(
         chain_address,
@@ -309,7 +338,7 @@ fn solidity_abi_encode_and_keccak(chain: Address, from: U256, to: U256, data: &B
 async fn build_execute_batches_data(
     pool: PgPool,
     batch_number: u32,
-    priority_tree_start_index: Option<usize>,
+    initial_mini_merkle_tree: MiniMerkleTree,
     chain_protocol_version: Option<u16>,
 ) -> Result<(U256, U256, Bytes)> {
     let batch = load_l1_batch_with_metadata(&pool, batch_number)
@@ -332,7 +361,9 @@ async fn build_execute_batches_data(
     }
 
     let priority_ops_proofs =
-        build_priority_ops_proofs(&pool, &l1_batches, priority_tree_start_index).await?;
+        build_priority_ops_proofs(&pool, &l1_batches, initial_mini_merkle_tree).await?;
+
+    println!("Priority ops proofs: {:#?}", priority_ops_proofs);
 
     let execute = ExecuteBatches {
         l1_batches,
@@ -361,53 +392,43 @@ async fn build_execute_batches_data(
 async fn build_priority_ops_proofs(
     pool: &PgPool,
     l1_batches: &[L1BatchWithMetadata],
-    priority_tree_start_index: Option<usize>,
+    initial_mini_merkle_tree: MiniMerkleTree,
 ) -> Result<Vec<PriorityOpsMerkleProof>> {
-    let Some(priority_tree_start_index) = priority_tree_start_index else {
-        return Ok(vec![PriorityOpsMerkleProof::default(); l1_batches.len()]);
-    };
-
-    let priority_op_hashes = get_l1_transactions_hashes(pool, priority_tree_start_index)
+    let mut mini_merkle_tree = initial_mini_merkle_tree.clone();
+    // This is slow (as we are re-loading all L1 tx hashes from the DB), but simpler to implement.
+    let priority_op_hashes = get_l1_transactions_hashes(pool, mini_merkle_tree.start_index)
         .await
         .context("get_l1_transactions_hashes")?;
 
-    let mut priority_merkle_tree = MiniMerkleTree::from_hashes(priority_op_hashes);
+    println!("Got {} priority op hashes", priority_op_hashes.len());
+    for h in &priority_op_hashes {
+        println!("Priority op hash: {:#x}", h);
+        mini_merkle_tree.push_hash(*h);
+    }
 
     let mut priority_ops_proofs = Vec::with_capacity(l1_batches.len());
     for batch in l1_batches {
+        println!("Building proof for batch {}", batch.header.number);
         let first_priority_op_id_option = get_batch_first_priority_op_id(pool, batch.header.number)
             .await
-            .context("get_batch_first_priority_op_id")?
-            .filter(|id| *id >= priority_tree_start_index);
+            .context("get_batch_first_priority_op_id")?;
+        println!("First priority op id: {:#?}", first_priority_op_id_option);
 
         let count = batch.header.l1_tx_count as usize;
+        // TODO: what to do if count == 0?
         if count == 0 || first_priority_op_id_option.is_none() {
             priority_ops_proofs.push(PriorityOpsMerkleProof::default());
             continue;
         }
 
         let first_priority_op_id_in_batch = first_priority_op_id_option.unwrap();
-        let new_l1_tx_hashes = get_l1_transactions_hashes(
-            pool,
-            priority_tree_start_index + priority_merkle_tree.length(),
-        )
-        .await
-        .context("get_l1_transactions_hashes for update")?;
 
-        for hash in new_l1_tx_hashes {
-            priority_merkle_tree.push_hash(hash);
-        }
+        mini_merkle_tree.trim_start(first_priority_op_id_in_batch - mini_merkle_tree.start_index());
 
-        priority_merkle_tree.trim_start(
-            first_priority_op_id_in_batch
-                - priority_tree_start_index
-                - priority_merkle_tree.start_index(),
-        );
-
-        let (_root, left, right) = priority_merkle_tree.merkle_root_and_paths_for_range(..count);
+        let (_root, left, right) = mini_merkle_tree.merkle_root_and_paths_for_range(..count);
         let left_path: Vec<H256> = left.into_iter().map(Option::unwrap_or_default).collect();
         let right_path: Vec<H256> = right.into_iter().map(Option::unwrap_or_default).collect();
-        let hashes = priority_merkle_tree.hashes_prefix(count);
+        let hashes = mini_merkle_tree.hashes_prefix(count);
 
         priority_ops_proofs.push(PriorityOpsMerkleProof {
             left_path,
@@ -814,6 +835,7 @@ async fn get_interop_roots_batch(pool: &PgPool, batch_number: u32) -> Result<Vec
     Ok(roots)
 }
 
+// This will NOT work
 async fn get_l1_transactions_hashes(pool: &PgPool, start_id: usize) -> Result<Vec<H256>> {
     let rows = sqlx::query(
         r#"
@@ -884,6 +906,19 @@ struct MiniMerkleTree {
 }
 
 impl MiniMerkleTree {
+    fn from_start_index_and_proof(start_index: usize, proof: Vec<H256>) -> Self {
+        // Check if not off by one.
+        let binary_tree_size = 1 << proof.len();
+        let depth = tree_depth_by_size(binary_tree_size);
+        assert_eq!(proof.len(), depth);
+        Self {
+            hashes: VecDeque::new(),
+            binary_tree_size,
+            start_index,
+            cache: proof.into_iter().map(Some).collect(),
+        }
+    }
+
     fn from_hashes(hashes: Vec<H256>) -> Self {
         let hashes: VecDeque<_> = hashes.into_iter().collect();
         let mut binary_tree_size = hashes.len().next_power_of_two();
