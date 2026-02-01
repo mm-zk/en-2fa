@@ -62,8 +62,28 @@ pub async fn get_priority_op_merkle_path(
     .unwrap();
 
     let priority_ops_list = decoded_executed_payload[1].clone().into_array().unwrap();
+
+    // 4 batches.
+    println!("Priority ops list length: {}", priority_ops_list.len());
+
     let first_priority_ops = priority_ops_list[0].clone().into_tuple().unwrap();
+    println!("First priority ops length: {}", first_priority_ops.len());
+
     let first_left_priority_ops = first_priority_ops[0].clone().into_array().unwrap();
+
+    let first_left_ops = tokens_to_h256_vec(first_left_priority_ops.clone());
+    //let first_right_ops = tokens_to_h256_vec(first_priority_ops[1].clone().into_array().unwrap());
+
+    let second_left_ops = tokens_to_h256_vec(
+        priority_ops_list[1].clone().into_tuple().unwrap()[0]
+            .clone()
+            .into_array()
+            .unwrap(),
+    );
+
+    println!("First left ops: {:?}", first_left_ops);
+    //println!("First right ops: {:?}", first_right_ops);
+    println!("Second left ops: {:?}", second_left_ops);
 
     Ok((
         first_batch,
@@ -72,4 +92,11 @@ pub async fn get_priority_op_merkle_path(
             .map(|h| H256::from_slice(&h.into_fixed_bytes().unwrap()))
             .collect(),
     ))
+}
+
+fn tokens_to_h256_vec(tokens: Vec<ethers::abi::Token>) -> Vec<H256> {
+    tokens
+        .into_iter()
+        .map(|t| H256::from_slice(&t.into_fixed_bytes().unwrap()))
+        .collect()
 }

@@ -19,7 +19,13 @@ mod utils;
 
 const CONTRACT_ADDR: &str = "0xE222D6354b49eaF8a7099fC4E7F9C0B4FE72d1E7";
 
-const SAMPLE_TX: &str = "0xb4c1ea93f17e77cdbf6c47868e7727c18917eff489e626b8f8c4ab121a8438d6";
+// With 6
+//const SAMPLE_TX: &str = "0xb4c1ea93f17e77cdbf6c47868e7727c18917eff489e626b8f8c4ab121a8438d6";
+
+// With 2
+const SAMPLE_TX: &str = "0x08dc9dfe4d8a6fc97a16c6b4eb028f3f5dcd9b4368f4a8f0ce11b42dedba8a83";
+
+const PRIORITY_TREE_START_INDEX: usize = 3270719;
 
 abigen!(
     ExecutionMultisigValidator,
@@ -159,9 +165,46 @@ async fn main() -> Result<()> {
 
     let initial_mini_merkle_tree = MiniMerkleTree::from_start_index_and_proof(
         //first_priority_op_id.checked_sub(1).unwrap(),
-        first_priority_op_id,
+        first_priority_op_id - PRIORITY_TREE_START_INDEX,
         proof,
     );
+
+    println!(
+        "Mini merkle tree initialized to start index {}",
+        initial_mini_merkle_tree.start_index()
+    );
+    {
+        let first_priority_op_id =
+            get_batch_first_priority_op_id(&pool.clone(), batch_number.as_u32())
+                .await
+                .context("get_batch_first_priority_op_id")?
+                .unwrap();
+        let next_batch = get_batch_first_priority_op_id(&pool.clone(), batch_number.as_u32() + 1)
+            .await
+            .context("get_batch_first_priority_op_id")?
+            .unwrap();
+
+        println!(
+            "First priority op id in batch {} is {}, next batch starts at {}",
+            batch_number, first_priority_op_id, next_batch
+        );
+        let priority_op_hashes = get_l1_transactions_hashes(&pool, first_priority_op_id)
+            .await
+            .context("get_l1_transactions_hashes")?;
+        let my_hashes = priority_op_hashes.iter().take(2);
+
+        let mut my_merkle = initial_mini_merkle_tree.clone();
+        for h in my_hashes {
+            println!("Priority op hash: {:#x}", h);
+            my_merkle.push_hash(*h);
+        }
+        let (a, b, c) = my_merkle.merkle_root_and_paths_for_range(..2);
+        println!("Merkle root after adding 6 hashes: {:#x}", a);
+        println!("Left path: {:#?}", b);
+        println!("Right path: {:#?}", c);
+    }
+
+    panic!("stop here");
 
     // Running just a single batch manually (mostly for testing).
     if let Some(run_one_batch) = args.run_one_batch {
@@ -400,9 +443,12 @@ async fn build_priority_ops_proofs(
         .await
         .context("get_l1_transactions_hashes")?;
 
-    println!("Got {} priority op hashes", priority_op_hashes.len());
+    println!(
+        "Got {} priority op hashes newer than {}",
+        priority_op_hashes.len(),
+        mini_merkle_tree.start_index()
+    );
     for h in &priority_op_hashes {
-        println!("Priority op hash: {:#x}", h);
         mini_merkle_tree.push_hash(*h);
     }
 
@@ -909,6 +955,10 @@ impl MiniMerkleTree {
     fn from_start_index_and_proof(start_index: usize, proof: Vec<H256>) -> Self {
         // Check if not off by one.
         let binary_tree_size = 1 << proof.len();
+        println!(
+            "Initializing MiniMerkleTree with start_index {} and binary_tree_size {}",
+            start_index, binary_tree_size
+        );
         let depth = tree_depth_by_size(binary_tree_size);
         assert_eq!(proof.len(), depth);
         Self {
@@ -987,6 +1037,10 @@ impl MiniMerkleTree {
         side: Option<Side>,
     ) -> H256 {
         let depth = tree_depth_by_size(self.binary_tree_size);
+        println!(
+            "Computing merkle root at depth {} binary tree size: {}",
+            depth, self.binary_tree_size
+        );
         if let Some(path) = path.as_deref_mut() {
             path.reserve(depth);
         }
@@ -995,6 +1049,10 @@ impl MiniMerkleTree {
         let mut absolute_start_index = self.start_index;
 
         for level in 0..depth {
+            println!(
+                "On level {}, index {} absolute_start index {}",
+                level, index, absolute_start_index
+            );
             if absolute_start_index % 2 == 1 {
                 hashes.push_front(self.cache[level].expect("cache is invalid"));
                 index += 1;
@@ -1013,10 +1071,12 @@ impl MiniMerkleTree {
             }
 
             let level_len = hashes.len() / 2;
+            println!("Hashes before compression: {:?}", hashes);
             for i in 0..level_len {
                 hashes[i] = compress_hashes(&hashes[2 * i], &hashes[2 * i + 1]);
             }
             hashes.truncate(level_len);
+            println!("Hashes after compression: {:?}", hashes);
             index /= 2;
             absolute_start_index /= 2;
         }
