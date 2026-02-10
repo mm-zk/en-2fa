@@ -1,5 +1,6 @@
 use std::{str::FromStr, time::Duration};
 
+use alloy::sol_types::SolValue;
 use anyhow::Context;
 use ethers::{
     abi::ParamType,
@@ -7,13 +8,15 @@ use ethers::{
     types::{H256, U256},
 };
 
+use crate::{ExecutePayload, InteropRootSol, StoredBatchInfoSol};
+
 /// Takes a given "trusted" transaction (that should be an existing "ExecuteBatches" on-chain tx),
 /// and extracts the Merkle path for the first priority operation in the first batch included in that
 /// transaction.
 pub async fn get_priority_op_merkle_path(
     eth_rpc_url: &str,
     tx: &str,
-) -> anyhow::Result<(U256, Vec<H256>)> {
+) -> anyhow::Result<(U256, Vec<H256>, Vec<H256>)> {
     let eth_provider = Provider::<Http>::try_from(eth_rpc_url)
         .context("Failed to create provider (ETH_RPC_URL)")?
         .interval(Duration::from_millis(200));
@@ -43,53 +46,36 @@ pub async fn get_priority_op_merkle_path(
     )
     .unwrap();
 
+    println!(
+        "Address is {:?}",
+        decoded_execute_batches[0].clone().into_address().unwrap()
+    );
+
     let first_batch = decoded_execute_batches[1].clone().into_uint().unwrap();
+    println!("First batch number: {}", first_batch);
 
     let payload = decoded_execute_batches[3].clone().into_bytes().unwrap();
     // First element is a version.
     assert_eq!(payload[0], 1u8);
 
-    let decoded_executed_payload = ethers::abi::decode(
-        &[
-            ParamType::Array(Box::new(ParamType::Tuple(vec![ParamType::Uint(64)]))),
-            ParamType::Array(Box::new(ParamType::Tuple(vec![ParamType::Array(
-                Box::new(ParamType::FixedBytes(32)),
-            )]))),
-            ParamType::Array(Box::new(ParamType::Bytes)),
-        ],
-        &payload[1..],
-    )
-    .unwrap();
+    let execute_payload = ExecutePayload::abi_decode_sequence(&payload[1..]).unwrap();
 
-    let priority_ops_list = decoded_executed_payload[1].clone().into_array().unwrap();
+    let priority_ops = &execute_payload.priorityOpsData[0];
 
-    // 4 batches.
-    println!("Priority ops list length: {}", priority_ops_list.len());
+    println!("Priority ops: {:?}", priority_ops);
 
-    let first_priority_ops = priority_ops_list[0].clone().into_tuple().unwrap();
-    println!("First priority ops length: {}", first_priority_ops.len());
-
-    let first_left_priority_ops = first_priority_ops[0].clone().into_array().unwrap();
-
-    let first_left_ops = tokens_to_h256_vec(first_left_priority_ops.clone());
-    //let first_right_ops = tokens_to_h256_vec(first_priority_ops[1].clone().into_array().unwrap());
-
-    let second_left_ops = tokens_to_h256_vec(
-        priority_ops_list[1].clone().into_tuple().unwrap()[0]
-            .clone()
-            .into_array()
-            .unwrap(),
-    );
-
-    println!("First left ops: {:?}", first_left_ops);
-    //println!("First right ops: {:?}", first_right_ops);
-    println!("Second left ops: {:?}", second_left_ops);
+    let priority_ops_left = &priority_ops.leftPath;
+    let priority_ops_right = &priority_ops.rightPath;
 
     Ok((
         first_batch,
-        first_left_priority_ops
-            .into_iter()
-            .map(|h| H256::from_slice(&h.into_fixed_bytes().unwrap()))
+        priority_ops_left
+            .iter()
+            .map(|h| H256::from_slice(h.as_slice()))
+            .collect(),
+        priority_ops_right
+            .iter()
+            .map(|h| H256::from_slice(h.as_slice()))
             .collect(),
     ))
 }

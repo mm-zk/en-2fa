@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Context, Result};
+use alloy::serde::quantity::vec;
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use dotenvy::dotenv;
 use ethers::abi::{ParamType, Token};
@@ -7,10 +8,11 @@ use ethers::types::{Address, Bytes, H256, U256};
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 
 mod db;
+use alloy::sol;
 use db::{BatchDb, PostgresBatchDb};
 use sqlx::{PgPool, Row};
 
@@ -23,7 +25,7 @@ const CONTRACT_ADDR: &str = "0xE222D6354b49eaF8a7099fC4E7F9C0B4FE72d1E7";
 //const SAMPLE_TX: &str = "0xb4c1ea93f17e77cdbf6c47868e7727c18917eff489e626b8f8c4ab121a8438d6";
 
 // With 2
-const SAMPLE_TX: &str = "0x08dc9dfe4d8a6fc97a16c6b4eb028f3f5dcd9b4368f4a8f0ce11b42dedba8a83";
+const SAMPLE_TX: &str = "0x90e96f5b26803a6ba4cee7bcd25de241167b5ed03feec486518a6346939437d9";
 
 const PRIORITY_TREE_START_INDEX: usize = 3270719;
 
@@ -38,6 +40,44 @@ abigen!(
         function executeBatchesSharedBridge(address _chainAddress, uint256 _processBatchFrom, uint256 _processBatchTo, bytes calldata _batchData) 
     ]"#
 );
+
+sol! {
+    #[derive(Debug)]
+    struct StoredBatchInfoSol {
+        uint64 batchNumber;
+        bytes32 batchHash; // For ZKsync OS batches we'll store here full state commitment
+        uint64 indexRepeatedStorageChanges; // For ZKsync OS not used, always set to 0
+        uint256 numberOfLayer1Txs;
+        bytes32 priorityOperationsHash;
+        bytes32 dependencyRootsRollingHash;
+        bytes32 l2LogsTreeRoot;
+        uint256 timestamp; // For ZKsync OS not used, always set to 0
+        bytes32 commitment; // For ZKsync OS batches we'll store batch output hash here
+    }
+    #[derive(Debug)]
+    struct PriorityOpsBatchInfo {
+        bytes32[] leftPath;
+        bytes32[] rightPath;
+        bytes32[] itemHashes;
+    }
+    #[derive(Debug)]
+    struct InteropRootSol {
+        uint256 chainId;
+        uint256 blockOrBatchNumber;
+        // We are double overloading this. The sides of the dynamic incremental merkle tree normally contains the root, as well as the sides of the tree.
+        // Second overloading: if the length is 1, we are importing a chainBatchRoot/messageRoot instead of sides.
+        bytes32[] sides;
+    }
+
+    #[derive(Debug)]
+    struct ExecutePayload {
+        StoredBatchInfoSol[] memory executeData;
+        PriorityOpsBatchInfo[] memory priorityOpsData;
+        InteropRootSol[][] memory dependencyRoots;
+
+    }
+
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -154,57 +194,34 @@ async fn main() -> Result<()> {
         .context("Failed to connect to Postgres (DATABASE_URL)")?;
     let db = PostgresBatchDb::new(pool.clone());
 
-    let (batch_number, proof) = get_priority_op_merkle_path(args.eth_rpc_url.as_str(), SAMPLE_TX)
-        .await
-        .unwrap();
+    let (batch_number, proof, _) =
+        get_priority_op_merkle_path(args.eth_rpc_url.as_str(), SAMPLE_TX)
+            .await
+            .unwrap();
 
     let first_priority_op_id = get_batch_first_priority_op_id(&pool.clone(), batch_number.as_u32())
         .await
         .context("get_batch_first_priority_op_id")?
         .unwrap();
 
-    let initial_mini_merkle_tree = MiniMerkleTree::from_start_index_and_proof(
+    let mut initial_mini_merkle_tree = MiniMerkleTree::from_start_index_and_proof(
         //first_priority_op_id.checked_sub(1).unwrap(),
         first_priority_op_id - PRIORITY_TREE_START_INDEX,
         proof,
     );
+    let added = add_batch_tx_to_merkle(
+        &pool,
+        &load_l1_batch_with_metadata(&pool, batch_number.as_u32()).await?,
+        &mut initial_mini_merkle_tree,
+    )
+    .await?;
+
+    initial_mini_merkle_tree.trim_start(added);
 
     println!(
         "Mini merkle tree initialized to start index {}",
         initial_mini_merkle_tree.start_index()
     );
-    {
-        let first_priority_op_id =
-            get_batch_first_priority_op_id(&pool.clone(), batch_number.as_u32())
-                .await
-                .context("get_batch_first_priority_op_id")?
-                .unwrap();
-        let next_batch = get_batch_first_priority_op_id(&pool.clone(), batch_number.as_u32() + 1)
-            .await
-            .context("get_batch_first_priority_op_id")?
-            .unwrap();
-
-        println!(
-            "First priority op id in batch {} is {}, next batch starts at {}",
-            batch_number, first_priority_op_id, next_batch
-        );
-        let priority_op_hashes = get_l1_transactions_hashes(&pool, first_priority_op_id)
-            .await
-            .context("get_l1_transactions_hashes")?;
-        let my_hashes = priority_op_hashes.iter().take(2);
-
-        let mut my_merkle = initial_mini_merkle_tree.clone();
-        for h in my_hashes {
-            println!("Priority op hash: {:#x}", h);
-            my_merkle.push_hash(*h);
-        }
-        let (a, b, c) = my_merkle.merkle_root_and_paths_for_range(..2);
-        println!("Merkle root after adding 6 hashes: {:#x}", a);
-        println!("Left path: {:#?}", b);
-        println!("Right path: {:#?}", c);
-    }
-
-    panic!("stop here");
 
     // Running just a single batch manually (mostly for testing).
     if let Some(run_one_batch) = args.run_one_batch {
@@ -388,7 +405,7 @@ async fn build_execute_batches_data(
         .await
         .context("load_l1_batch_with_metadata")?;
 
-    let l1_batches = vec![batch];
+    let l1_batches = vec![batch.clone()];
 
     let internal_pv = l1_batches[0].header.protocol_version.unwrap_or(0);
     let mut dependency_roots: Vec<Vec<InteropRoot>> = Vec::with_capacity(l1_batches.len());
@@ -403,14 +420,14 @@ async fn build_execute_batches_data(
         }
     }
 
-    let priority_ops_proofs =
-        build_priority_ops_proofs(&pool, &l1_batches, initial_mini_merkle_tree).await?;
+    let priority_ops_proof =
+        build_priority_ops_proofs(&pool, &batch, initial_mini_merkle_tree).await?;
 
-    println!("Priority ops proofs: {:#?}", priority_ops_proofs);
+    println!("Priority ops proof: {:#?}", priority_ops_proof);
 
     let execute = ExecuteBatches {
-        l1_batches,
-        priority_ops_proofs,
+        l1_batches: vec![batch],
+        priority_ops_proofs: vec![priority_ops_proof],
         dependency_roots,
     };
 
@@ -432,58 +449,80 @@ async fn build_execute_batches_data(
     Ok((from_batch, to_batch, batch_data))
 }
 
+async fn add_batch_tx_to_merkle(
+    pool: &PgPool,
+    l1_batch: &L1BatchWithMetadata,
+    mini_merkle_tree: &mut MiniMerkleTree,
+) -> Result<usize> {
+    let batch_number = l1_batch.header.number;
+
+    let first_priority_op_id = get_batch_first_priority_op_id(&pool.clone(), batch_number)
+        .await
+        .context("get_batch_first_priority_op_id")?;
+
+    match first_priority_op_id {
+        None => {
+            return Ok(0);
+        }
+        Some(first_priority_op_id) => {
+            assert_eq!(
+                first_priority_op_id,
+                mini_merkle_tree.start_index() + PRIORITY_TREE_START_INDEX
+            );
+
+            // This is slow (as we are re-loading all L1 tx hashes from the DB), but simpler to implement.
+            let priority_op_hashes = get_l1_transactions_hashes(pool, first_priority_op_id)
+                .await
+                .context("get_l1_transactions_hashes")?;
+
+            println!(
+                "Got {} priority op hashes newer than {}",
+                priority_op_hashes.len(),
+                first_priority_op_id
+            );
+
+            let count = l1_batch.header.l1_tx_count as usize;
+
+            // only take as many L1 tx as the batch contains.
+            for h in priority_op_hashes.iter().take(count) {
+                mini_merkle_tree.push_hash(*h);
+            }
+
+            Ok(count)
+        }
+    }
+}
+
 async fn build_priority_ops_proofs(
     pool: &PgPool,
-    l1_batches: &[L1BatchWithMetadata],
+    l1_batch: &L1BatchWithMetadata,
     initial_mini_merkle_tree: MiniMerkleTree,
-) -> Result<Vec<PriorityOpsMerkleProof>> {
+) -> Result<PriorityOpsMerkleProof> {
     let mut mini_merkle_tree = initial_mini_merkle_tree.clone();
-    // This is slow (as we are re-loading all L1 tx hashes from the DB), but simpler to implement.
-    let priority_op_hashes = get_l1_transactions_hashes(pool, mini_merkle_tree.start_index)
+
+    let count = add_batch_tx_to_merkle(pool, l1_batch, &mut mini_merkle_tree)
         .await
-        .context("get_l1_transactions_hashes")?;
+        .context("add_batch_tx_to_merkle")?;
 
-    println!(
-        "Got {} priority op hashes newer than {}",
-        priority_op_hashes.len(),
-        mini_merkle_tree.start_index()
-    );
-    for h in &priority_op_hashes {
-        mini_merkle_tree.push_hash(*h);
+    if count == 0 {
+        // No priority ops in this batch, so the proof is empty.
+        return Ok(PriorityOpsMerkleProof::default());
     }
 
-    let mut priority_ops_proofs = Vec::with_capacity(l1_batches.len());
-    for batch in l1_batches {
-        println!("Building proof for batch {}", batch.header.number);
-        let first_priority_op_id_option = get_batch_first_priority_op_id(pool, batch.header.number)
-            .await
-            .context("get_batch_first_priority_op_id")?;
-        println!("First priority op id: {:#?}", first_priority_op_id_option);
+    let batch = l1_batch;
 
-        let count = batch.header.l1_tx_count as usize;
-        // TODO: what to do if count == 0?
-        if count == 0 || first_priority_op_id_option.is_none() {
-            priority_ops_proofs.push(PriorityOpsMerkleProof::default());
-            continue;
-        }
+    println!("Building proof for batch {}", batch.header.number);
 
-        let first_priority_op_id_in_batch = first_priority_op_id_option.unwrap();
+    let (_root, left, right) = mini_merkle_tree.merkle_root_and_paths_for_range(..count);
+    let left_path: Vec<H256> = left.into_iter().map(Option::unwrap_or_default).collect();
+    let right_path: Vec<H256> = right.into_iter().map(Option::unwrap_or_default).collect();
+    let hashes = mini_merkle_tree.hashes_prefix(count);
 
-        mini_merkle_tree.trim_start(first_priority_op_id_in_batch - mini_merkle_tree.start_index());
-
-        let (_root, left, right) = mini_merkle_tree.merkle_root_and_paths_for_range(..count);
-        let left_path: Vec<H256> = left.into_iter().map(Option::unwrap_or_default).collect();
-        let right_path: Vec<H256> = right.into_iter().map(Option::unwrap_or_default).collect();
-        let hashes = mini_merkle_tree.hashes_prefix(count);
-
-        priority_ops_proofs.push(PriorityOpsMerkleProof {
-            left_path,
-            right_path,
-            hashes,
-        });
-    }
-
-    Ok(priority_ops_proofs)
+    return Ok(PriorityOpsMerkleProof {
+        left_path,
+        right_path,
+        hashes,
+    });
 }
 
 #[derive(Debug, Clone)]
