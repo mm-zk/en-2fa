@@ -8,7 +8,7 @@ use ethers::{
     types::{H256, U256},
 };
 
-use crate::{ExecutePayload, InteropRootSol, StoredBatchInfoSol};
+use crate::ExecutePayload;
 
 /// Takes a given "trusted" transaction (that should be an existing "ExecuteBatches" on-chain tx),
 /// and extracts the Merkle path for the first priority operation in the first batch included in that
@@ -46,13 +46,7 @@ pub async fn get_priority_op_merkle_path(
     )
     .unwrap();
 
-    println!(
-        "Address is {:?}",
-        decoded_execute_batches[0].clone().into_address().unwrap()
-    );
-
     let first_batch = decoded_execute_batches[1].clone().into_uint().unwrap();
-    println!("First batch number: {}", first_batch);
 
     let payload = decoded_execute_batches[3].clone().into_bytes().unwrap();
     // First element is a version.
@@ -61,8 +55,6 @@ pub async fn get_priority_op_merkle_path(
     let execute_payload = ExecutePayload::abi_decode_sequence(&payload[1..]).unwrap();
 
     let priority_ops = &execute_payload.priorityOpsData[0];
-
-    println!("Priority ops: {:?}", priority_ops);
 
     let priority_ops_left = &priority_ops.leftPath;
     let priority_ops_right = &priority_ops.rightPath;
@@ -78,11 +70,4 @@ pub async fn get_priority_op_merkle_path(
             .map(|h| H256::from_slice(h.as_slice()))
             .collect(),
     ))
-}
-
-fn tokens_to_h256_vec(tokens: Vec<ethers::abi::Token>) -> Vec<H256> {
-    tokens
-        .into_iter()
-        .map(|t| H256::from_slice(&t.into_fixed_bytes().unwrap()))
-        .collect()
 }

@@ -1,33 +1,26 @@
-use alloy::serde::quantity::vec;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use dotenvy::dotenv;
-use ethers::abi::{ParamType, Token};
+use ethers::abi::Token;
 use ethers::prelude::*;
 use ethers::types::{Address, Bytes, H256, U256};
-use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
-use tracing::{info, warn};
+use tracing::level_filters::LevelFilter;
+use tracing::{debug, info, warn};
+use tracing_subscriber::EnvFilter;
 
 mod db;
 use alloy::sol;
 use db::{BatchDb, PostgresBatchDb};
 use sqlx::{PgPool, Row};
+mod merkle;
 
-use crate::utils::get_priority_op_merkle_path;
+use crate::merkle::{MiniMerkleTree, initialize_merkle_tree, prepare_merkle_up_to_priority_op};
 mod utils;
 
 const CONTRACT_ADDR: &str = "0xE222D6354b49eaF8a7099fC4E7F9C0B4FE72d1E7";
-
-// With 6
-//const SAMPLE_TX: &str = "0xb4c1ea93f17e77cdbf6c47868e7727c18917eff489e626b8f8c4ab121a8438d6";
-
-// With 2
-const SAMPLE_TX: &str = "0x90e96f5b26803a6ba4cee7bcd25de241167b5ed03feec486518a6346939437d9";
-
-const PRIORITY_TREE_START_INDEX: usize = 3270719;
 
 abigen!(
     ExecutionMultisigValidator,
@@ -123,7 +116,8 @@ async fn main() -> Result<()> {
     dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::default().add_directive(LevelFilter::INFO.into())),
         )
         .init();
 
@@ -157,7 +151,6 @@ async fn main() -> Result<()> {
 
     let signer_addr = wallet.address();
     info!(%chain_id, %signer_addr, "Ethereum signer ready");
-    println!("here!");
 
     let client = Arc::new(SignerMiddleware::new(eth_provider.clone(), wallet));
     let contract_addr = Address::from_str(CONTRACT_ADDR).context("Bad CONTRACT_ADDR")?;
@@ -194,38 +187,13 @@ async fn main() -> Result<()> {
         .context("Failed to connect to Postgres (DATABASE_URL)")?;
     let db = PostgresBatchDb::new(pool.clone());
 
-    let (batch_number, proof, _) =
-        get_priority_op_merkle_path(args.eth_rpc_url.as_str(), SAMPLE_TX)
-            .await
-            .unwrap();
-
-    let first_priority_op_id = get_batch_first_priority_op_id(&pool.clone(), batch_number.as_u32())
-        .await
-        .context("get_batch_first_priority_op_id")?
-        .unwrap();
-
-    let mut initial_mini_merkle_tree = MiniMerkleTree::from_start_index_and_proof(
-        //first_priority_op_id.checked_sub(1).unwrap(),
-        first_priority_op_id - PRIORITY_TREE_START_INDEX,
-        proof,
-    );
-    let added = add_batch_tx_to_merkle(
-        &pool,
-        &load_l1_batch_with_metadata(&pool, batch_number.as_u32()).await?,
-        &mut initial_mini_merkle_tree,
-    )
-    .await?;
-
-    initial_mini_merkle_tree.trim_start(added);
-
-    println!(
-        "Mini merkle tree initialized to start index {}",
-        initial_mini_merkle_tree.start_index()
-    );
-
     // Running just a single batch manually (mostly for testing).
     if let Some(run_one_batch) = args.run_one_batch {
         info!(batch=%run_one_batch, "Running single batch as requested; exiting after");
+        let mut initial_mini_merkle_tree =
+            initialize_merkle_tree(pool.clone(), &args.eth_rpc_url, Some(run_one_batch - 1))
+                .await?;
+
         run_single_batch(
             pool.clone(),
             run_one_batch as i64,
@@ -233,7 +201,7 @@ async fn main() -> Result<()> {
             &args,
             contract.clone(),
             signer_addr,
-            initial_mini_merkle_tree,
+            &mut initial_mini_merkle_tree,
         )
         .await
         .with_context(|| format!("run_single_batch for L1 batch {}", run_one_batch))?;
@@ -242,6 +210,8 @@ async fn main() -> Result<()> {
 
     // Automatic looping mode.
     let mut last_seen_batch: i64 = 0;
+    let mut initial_mini_merkle_tree =
+        initialize_merkle_tree(pool.clone(), &args.eth_rpc_url, None).await?;
 
     loop {
         match db.fetch_next_ready_execute_call(last_seen_batch).await? {
@@ -259,7 +229,7 @@ async fn main() -> Result<()> {
                     &args,
                     contract.clone(),
                     signer_addr,
-                    initial_mini_merkle_tree.clone(),
+                    &mut initial_mini_merkle_tree,
                 )
                 .await
                 .with_context(|| {
@@ -281,23 +251,23 @@ async fn run_single_batch(
     args: &Args,
     contract: ExecutionMultisigValidator<SignerMiddleware<Provider<Http>, LocalWallet>>,
     signer_addr: Address,
-    initial_mini_merkle_tree: MiniMerkleTree,
+    initial_mini_merkle_tree: &mut MiniMerkleTree,
 ) -> Result<()> {
     let (from_batch, to_batch, batch_data) = build_execute_batches_data(
-        pool,
+        pool.clone(),
         l1_batch_number as u32,
-        initial_mini_merkle_tree.clone(),
+        initial_mini_merkle_tree,
         args.chain_protocol_version,
     )
     .await
     .context("Failed to build executeBatchesSharedBridge data")?;
 
     // Print batch data as hex for debugging.
-    println!(
+    /*println!(
         "Batch data (len={}): 0x{}",
         batch_data.0.len(),
         hex::encode(&batch_data.0)
-    );
+    );*/
 
     let _calldata = build_execute_shared_bridge_calldata(
         chain_address,
@@ -316,6 +286,45 @@ async fn run_single_batch(
         .call()
         .await
         .context("Failed to read individualApprovals")?;
+
+    // Compare hashes - if this execute tx was already executed.
+    {
+        let db = PostgresBatchDb::new(pool.clone());
+
+        if let Ok(Some(execute_tx)) = db
+            .get_execution_tx_hash_for_batch(from_batch.as_u64() as i64)
+            .await
+        {
+            warn!(
+                "BATCH {} is already executed according to DB, checking hash on Ethereum mainnet...",
+                from_batch
+            );
+            let execute_tx_hash = H256::from_str(&execute_tx)
+                .context("Failed to parse execution tx hash from DB as H256")?;
+
+            let transaction = contract
+                .client()
+                .get_transaction(execute_tx_hash)
+                .await
+                .context("Failed to fetch execution transaction from Ethereum mainnet")?
+                .ok_or_else(|| anyhow!("Execution transaction not found on Ethereum mainnet"))?;
+
+            let onchain_calldata = transaction.input.0;
+
+            let onchain_hash = H256::from(ethers::utils::keccak256(&Bytes::from(
+                onchain_calldata[4..].to_vec(),
+            )));
+
+            if onchain_hash == approved_hash {
+                info!(" ALL GOOD - hashes match")
+            } else {
+                panic!(
+                    "WARNING !!!! Hash mismatch with already executed tx {:?}: expected {:?}, got {:?}",
+                    execute_tx_hash, approved_hash, onchain_hash
+                );
+            }
+        }
+    }
 
     if already {
         info!(batch=%l1_batch_number, hash=%approved_hash, "Already approved; skipping");
@@ -392,13 +401,14 @@ fn solidity_abi_encode_and_keccak(chain: Address, from: U256, to: U256, data: &B
         Token::Uint(to),
         Token::Bytes(data.to_vec()),
     ]);
+
     H256::from(ethers::utils::keccak256(encoded))
 }
 
 async fn build_execute_batches_data(
     pool: PgPool,
     batch_number: u32,
-    initial_mini_merkle_tree: MiniMerkleTree,
+    initial_mini_merkle_tree: &mut MiniMerkleTree,
     chain_protocol_version: Option<u16>,
 ) -> Result<(U256, U256, Bytes)> {
     let batch = load_l1_batch_with_metadata(&pool, batch_number)
@@ -422,8 +432,6 @@ async fn build_execute_batches_data(
 
     let priority_ops_proof =
         build_priority_ops_proofs(&pool, &batch, initial_mini_merkle_tree).await?;
-
-    println!("Priority ops proof: {:#?}", priority_ops_proof);
 
     let execute = ExecuteBatches {
         l1_batches: vec![batch],
@@ -459,27 +467,24 @@ async fn add_batch_tx_to_merkle(
     let first_priority_op_id = get_batch_first_priority_op_id(&pool.clone(), batch_number)
         .await
         .context("get_batch_first_priority_op_id")?;
+    debug!(
+        "First priority op id for batch {}: {:?}",
+        batch_number, first_priority_op_id
+    );
 
     match first_priority_op_id {
         None => {
             return Ok(0);
         }
         Some(first_priority_op_id) => {
-            assert_eq!(
-                first_priority_op_id,
-                mini_merkle_tree.start_index() + PRIORITY_TREE_START_INDEX
-            );
+            prepare_merkle_up_to_priority_op(pool, mini_merkle_tree, first_priority_op_id).await?;
+
+            assert_eq!(first_priority_op_id, mini_merkle_tree.next_priority_op_id());
 
             // This is slow (as we are re-loading all L1 tx hashes from the DB), but simpler to implement.
             let priority_op_hashes = get_l1_transactions_hashes(pool, first_priority_op_id)
                 .await
                 .context("get_l1_transactions_hashes")?;
-
-            println!(
-                "Got {} priority op hashes newer than {}",
-                priority_op_hashes.len(),
-                first_priority_op_id
-            );
 
             let count = l1_batch.header.l1_tx_count as usize;
 
@@ -496,11 +501,9 @@ async fn add_batch_tx_to_merkle(
 async fn build_priority_ops_proofs(
     pool: &PgPool,
     l1_batch: &L1BatchWithMetadata,
-    initial_mini_merkle_tree: MiniMerkleTree,
+    mini_merkle_tree: &mut MiniMerkleTree,
 ) -> Result<PriorityOpsMerkleProof> {
-    let mut mini_merkle_tree = initial_mini_merkle_tree.clone();
-
-    let count = add_batch_tx_to_merkle(pool, l1_batch, &mut mini_merkle_tree)
+    let count = add_batch_tx_to_merkle(pool, l1_batch, mini_merkle_tree)
         .await
         .context("add_batch_tx_to_merkle")?;
 
@@ -511,7 +514,7 @@ async fn build_priority_ops_proofs(
 
     let batch = l1_batch;
 
-    println!("Building proof for batch {}", batch.header.number);
+    info!("Building proof for batch {}", batch.header.number);
 
     let (_root, left, right) = mini_merkle_tree.merkle_root_and_paths_for_range(..count);
     let left_path: Vec<H256> = left.into_iter().map(Option::unwrap_or_default).collect();
@@ -920,7 +923,6 @@ async fn get_interop_roots_batch(pool: &PgPool, batch_number: u32) -> Result<Vec
     Ok(roots)
 }
 
-// This will NOT work
 async fn get_l1_transactions_hashes(pool: &PgPool, start_id: usize) -> Result<Vec<H256>> {
     let rows = sqlx::query(
         r#"
@@ -980,177 +982,4 @@ async fn get_batch_first_priority_op_id(pool: &PgPool, batch_number: u32) -> Res
 
     let id: Option<i64> = row.try_get("id")?;
     Ok(id.map(|v| v as usize))
-}
-
-#[derive(Debug, Clone)]
-struct MiniMerkleTree {
-    hashes: VecDeque<H256>,
-    binary_tree_size: usize,
-    start_index: usize,
-    cache: Vec<Option<H256>>,
-}
-
-impl MiniMerkleTree {
-    fn from_start_index_and_proof(start_index: usize, proof: Vec<H256>) -> Self {
-        // Check if not off by one.
-        let binary_tree_size = 1 << proof.len();
-        println!(
-            "Initializing MiniMerkleTree with start_index {} and binary_tree_size {}",
-            start_index, binary_tree_size
-        );
-        let depth = tree_depth_by_size(binary_tree_size);
-        assert_eq!(proof.len(), depth);
-        Self {
-            hashes: VecDeque::new(),
-            binary_tree_size,
-            start_index,
-            cache: proof.into_iter().map(Some).collect(),
-        }
-    }
-
-    fn from_hashes(hashes: Vec<H256>) -> Self {
-        let hashes: VecDeque<_> = hashes.into_iter().collect();
-        let mut binary_tree_size = hashes.len().next_power_of_two();
-        if binary_tree_size == 0 {
-            binary_tree_size = 1;
-        }
-        let depth = tree_depth_by_size(binary_tree_size);
-        Self {
-            hashes,
-            binary_tree_size,
-            start_index: 0,
-            cache: vec![None; depth],
-        }
-    }
-
-    fn length(&self) -> usize {
-        self.start_index + self.hashes.len()
-    }
-
-    fn start_index(&self) -> usize {
-        self.start_index
-    }
-
-    fn push_hash(&mut self, leaf_hash: H256) {
-        self.hashes.push_back(leaf_hash);
-        if self.start_index + self.hashes.len() > self.binary_tree_size {
-            self.binary_tree_size *= 2;
-            if self.cache.len() < tree_depth_by_size(self.binary_tree_size) {
-                self.cache.push(None);
-            }
-        }
-    }
-
-    fn hashes_prefix(&self, length: usize) -> Vec<H256> {
-        self.hashes.iter().take(length).copied().collect()
-    }
-
-    fn trim_start(&mut self, count: usize) {
-        let mut new_cache = vec![];
-        let root = self.compute_merkle_root_and_path(count, Some(&mut new_cache), Some(Side::Left));
-        self.hashes.drain(..count);
-        self.start_index += count;
-        if self.start_index == self.binary_tree_size {
-            new_cache.push(Some(root));
-        }
-        self.cache = new_cache;
-    }
-
-    fn merkle_root_and_paths_for_range(
-        &self,
-        range: std::ops::RangeTo<usize>,
-    ) -> (H256, Vec<Option<H256>>, Vec<Option<H256>>) {
-        let mut right_path = vec![];
-        let root_hash = self.compute_merkle_root_and_path(
-            range.end - 1,
-            Some(&mut right_path),
-            Some(Side::Right),
-        );
-        (root_hash, self.cache.clone(), right_path)
-    }
-
-    fn compute_merkle_root_and_path(
-        &self,
-        mut index: usize,
-        mut path: Option<&mut Vec<Option<H256>>>,
-        side: Option<Side>,
-    ) -> H256 {
-        let depth = tree_depth_by_size(self.binary_tree_size);
-        println!(
-            "Computing merkle root at depth {} binary tree size: {}",
-            depth, self.binary_tree_size
-        );
-        if let Some(path) = path.as_deref_mut() {
-            path.reserve(depth);
-        }
-
-        let mut hashes = self.hashes.clone();
-        let mut absolute_start_index = self.start_index;
-
-        for level in 0..depth {
-            println!(
-                "On level {}, index {} absolute_start index {}",
-                level, index, absolute_start_index
-            );
-            if absolute_start_index % 2 == 1 {
-                hashes.push_front(self.cache[level].expect("cache is invalid"));
-                index += 1;
-            }
-            if hashes.len() % 2 == 1 {
-                hashes.push_back(compute_empty_tree_hashes(empty_leaf_hash())[level]);
-            }
-
-            if let Some(path) = path.as_deref_mut() {
-                let hash = match side {
-                    Some(Side::Left) if index % 2 == 0 => None,
-                    Some(Side::Right) if index % 2 == 1 => None,
-                    _ => hashes.get(index ^ 1).copied(),
-                };
-                path.push(hash);
-            }
-
-            let level_len = hashes.len() / 2;
-            println!("Hashes before compression: {:?}", hashes);
-            for i in 0..level_len {
-                hashes[i] = compress_hashes(&hashes[2 * i], &hashes[2 * i + 1]);
-            }
-            hashes.truncate(level_len);
-            println!("Hashes after compression: {:?}", hashes);
-            index /= 2;
-            absolute_start_index /= 2;
-        }
-
-        hashes[0]
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Side {
-    Left,
-    Right,
-}
-
-fn compress_hashes(left: &H256, right: &H256) -> H256 {
-    let mut data = [0u8; 64];
-    data[..32].copy_from_slice(left.as_bytes());
-    data[32..].copy_from_slice(right.as_bytes());
-    H256::from(ethers::utils::keccak256(data))
-}
-
-fn empty_leaf_hash() -> H256 {
-    H256::from(ethers::utils::keccak256(&[]))
-}
-
-fn compute_empty_tree_hashes(empty_leaf_hash: H256) -> Vec<H256> {
-    let mut hashes = Vec::with_capacity(33);
-    let mut cur = empty_leaf_hash;
-    for _ in 0..=32 {
-        hashes.push(cur);
-        cur = compress_hashes(&cur, &cur);
-    }
-    hashes
-}
-
-fn tree_depth_by_size(tree_size: usize) -> usize {
-    tree_size.trailing_zeros() as usize
 }
