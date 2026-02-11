@@ -12,6 +12,8 @@ use crate::{
     utils::get_priority_op_merkle_path,
 };
 
+// cast call  -r https://ethereum-rpc.publicnode.com 0x32400084C286CF3E17e7B677ea9583e60a000324 "getPriorityTreeStartIndex()(uint256)"
+// 3270719 [3.27e6]
 const PRIORITY_TREE_START_INDEX: usize = 3270719;
 
 /// MiniMerkleTree keeps 'trimming/removing' the leftmost leafs to make it efficient.
