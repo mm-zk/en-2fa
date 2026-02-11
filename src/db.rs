@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ethers::types::H256;
 use sqlx::{PgPool, Row};
 
 #[derive(Debug, Clone)]
@@ -9,7 +10,21 @@ pub struct ReadyExecuteCall {
 /// Minimal DB interface so the rest of the program stays clean.
 #[async_trait::async_trait]
 pub trait BatchDb: Send + Sync {
-    async fn fetch_next_ready_execute_call(&self, min_batch_exclusive: i64) -> Result<Option<ReadyExecuteCall>>;
+    async fn fetch_next_ready_execute_call(
+        &self,
+        min_batch_exclusive: i64,
+    ) -> Result<Option<ReadyExecuteCall>>;
+    async fn get_latest_executed_batch_with_l1_tx_number(&self) -> Result<Option<i64>>;
+
+    async fn get_execution_tx_hash_for_batch(&self, batch_number: i64) -> Result<Option<String>>;
+
+    /// Gets all the priority transactions in a given range (exclusive of end_id).
+    /// All of them must exist in the db.
+    async fn get_l1_transactions_hashes_in_range(
+        &self,
+        start_id: usize,
+        end_id: usize,
+    ) -> Result<Vec<H256>>;
 }
 
 pub struct PostgresBatchDb {
@@ -24,7 +39,10 @@ impl PostgresBatchDb {
 
 #[async_trait::async_trait]
 impl BatchDb for PostgresBatchDb {
-    async fn fetch_next_ready_execute_call(&self, min_batch_exclusive: i64) -> Result<Option<ReadyExecuteCall>> {
+    async fn fetch_next_ready_execute_call(
+        &self,
+        min_batch_exclusive: i64,
+    ) -> Result<Option<ReadyExecuteCall>> {
         let row = sqlx::query(
             r#"
             SELECT
@@ -52,5 +70,116 @@ impl BatchDb for PostgresBatchDb {
             .context("Missing/invalid l1_batch_number column")?;
 
         Ok(Some(ReadyExecuteCall { l1_batch_number }))
+    }
+
+    async fn get_latest_executed_batch_with_l1_tx_number(&self) -> Result<Option<i64>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                number AS l1_batch_number
+            FROM l1_batches
+            WHERE
+                eth_execute_tx_id IS NOT NULL
+                AND l1_tx_count > 0
+            ORDER BY number DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("DB query failed while fetching latest executed batch with L1 tx number")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let l1_batch_number: i64 = row
+            .try_get("l1_batch_number")
+            .context("Missing/invalid l1_batch_number column")?;
+
+        Ok(Some(l1_batch_number))
+    }
+
+    async fn get_execution_tx_hash_for_batch(&self, batch_number: i64) -> Result<Option<String>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                eth_execute_tx_id
+            FROM l1_batches
+            WHERE
+                number = $1
+            "#,
+        )
+        .bind(batch_number)
+        .fetch_optional(&self.pool)
+        .await
+        .context("DB query failed while fetching execution tx hash for batch")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let eth_execute_tx_id: i32 = row
+            .try_get("eth_execute_tx_id")
+            .context("Missing/invalid eth_execute_tx_id column. w")?;
+
+        // Now get tx_has from the eth_txs_history, based off eth_execute_tx_id.
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tx_hash
+            FROM eth_txs_history
+            WHERE
+                eth_tx_id = $1
+            "#,
+        )
+        .bind(eth_execute_tx_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("DB query failed while fetching tx hash for execution tx id")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let tx_hash: String = row
+            .try_get("tx_hash")
+            .context("Missing/invalid tx_hash column")?;
+
+        Ok(Some(tx_hash))
+    }
+
+    async fn get_l1_transactions_hashes_in_range(
+        &self,
+        start_id: usize,
+        end_id: usize,
+    ) -> Result<Vec<H256>> {
+        let rows = sqlx::query(
+            r#" SELECT hash
+                FROM transactions
+                WHERE priority_op_id BETWEEN $1 AND $2
+                    AND is_priority = TRUE
+                ORDER BY priority_op_id
+            "#,
+        )
+        .bind(start_id as i64)
+        .bind((end_id - 1) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("DB query failed while fetching L1 transaction hashes in range")?;
+
+        let mut hashes = Vec::new();
+        for row in rows {
+            let hash = row.get::<Vec<u8>, _>("hash");
+            hashes.push(H256::from_slice(hash.as_slice()));
+        }
+
+        assert_eq!(
+            hashes.len(),
+            end_id - start_id,
+            "Some priority ops in the given range are missing in the DB"
+        );
+
+        Ok(hashes)
     }
 }
