@@ -119,11 +119,15 @@ impl BatchDb for PostgresBatchDb {
             return Ok(None);
         };
 
-        let eth_execute_tx_id: i32 = row
+        let eth_execute_tx_id: Option<i32> = row
             .try_get("eth_execute_tx_id")
-            .context("Missing/invalid eth_execute_tx_id column. w")?;
+            .context("Missing/invalid eth_execute_tx_id column")?;
 
-        // Now get tx_has from the eth_txs_history, based off eth_execute_tx_id.
+        let Some(eth_execute_tx_id) = eth_execute_tx_id else {
+            return Ok(None);
+        };
+
+        // Now get tx_hash from the eth_txs_history, based off eth_execute_tx_id.
         let row = sqlx::query(
             r#"
             SELECT

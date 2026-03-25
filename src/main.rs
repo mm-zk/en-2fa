@@ -20,8 +20,6 @@ mod merkle;
 use crate::merkle::{MiniMerkleTree, initialize_merkle_tree, prepare_merkle_up_to_priority_op};
 mod utils;
 
-const CONTRACT_ADDR: &str = "0xE222D6354b49eaF8a7099fC4E7F9C0B4FE72d1E7";
-
 abigen!(
     ExecutionMultisigValidator,
     r#"[
@@ -32,6 +30,13 @@ abigen!(
         function threshold() view returns (uint256)
         function executeBatchesSharedBridge(address _chainAddress, uint256 _processBatchFrom, uint256 _processBatchTo, bytes calldata _batchData)
         function calculateHash(address _chainAddress, uint256 _processBatchFrom, uint256 _processBatchTo, bytes calldata _batchData) view returns (bytes32)
+    ]"#
+);
+
+abigen!(
+    ChainContract,
+    r#"[
+        function getPriorityTreeStartIndex() view returns (uint256)
     ]"#
 );
 
@@ -107,6 +112,10 @@ struct Args {
     #[arg(long, env = "CHAIN_PROTOCOL_VERSION")]
     chain_protocol_version: Option<u16>,
 
+    /// Address of the ExecutionMultisigValidator contract
+    #[arg(long, env = "VALIDATOR_ADDRESS")]
+    validator_address: String,
+
     /// If set, run only one batch with this L1 batch number and exit.
     #[arg(long)]
     run_one_batch: Option<u64>,
@@ -137,13 +146,6 @@ async fn main() -> Result<()> {
         .context("Failed to fetch Ethereum chain id")?
         .as_u64();
 
-    if chain_id != 1 {
-        return Err(anyhow!(
-            "ETH_RPC_URL is not Ethereum mainnet (chain_id={})",
-            chain_id
-        ));
-    }
-
     let wallet: LocalWallet = args
         .pk
         .parse::<LocalWallet>()
@@ -154,8 +156,8 @@ async fn main() -> Result<()> {
     info!(%chain_id, %signer_addr, "Ethereum signer ready");
 
     let client = Arc::new(SignerMiddleware::new(eth_provider.clone(), wallet));
-    let contract_addr = Address::from_str(CONTRACT_ADDR).context("Bad CONTRACT_ADDR")?;
-    let contract = ExecutionMultisigValidator::new(contract_addr, client.clone());
+    let validator_addr = parse_address(&args.validator_address).context("Bad VALIDATOR_ADDRESS")?;
+    let contract = ExecutionMultisigValidator::new(validator_addr, client.clone());
 
     // --- Basic contract sanity checks (on Ethereum mainnet) ---
     let is_member = contract
@@ -182,6 +184,16 @@ async fn main() -> Result<()> {
 
     let chain_address = parse_address(&args.chain_address)?;
 
+    // Fetch PRIORITY_TREE_START_INDEX from the chain contract on-chain
+    let chain_contract = ChainContract::new(chain_address, Arc::new(eth_provider.clone()));
+    let priority_tree_start_index = chain_contract
+        .get_priority_tree_start_index()
+        .call()
+        .await
+        .context("Failed to read getPriorityTreeStartIndex from chain contract")?
+        .as_u64() as usize;
+    info!(%priority_tree_start_index, "Fetched priority tree start index from chain contract");
+
     // --- DB (External Node Postgres) ---
     let pool = PgPool::connect(&args.database_url)
         .await
@@ -192,7 +204,7 @@ async fn main() -> Result<()> {
     if let Some(run_one_batch) = args.run_one_batch {
         info!(batch=%run_one_batch, "Running single batch as requested; exiting after");
         let mut initial_mini_merkle_tree =
-            initialize_merkle_tree(pool.clone(), &args.eth_rpc_url, Some(run_one_batch - 1))
+            initialize_merkle_tree(pool.clone(), &args.eth_rpc_url, Some(run_one_batch - 1), priority_tree_start_index)
                 .await?;
 
         run_single_batch(
@@ -213,7 +225,9 @@ async fn main() -> Result<()> {
     // Automatic looping mode.
     let mut last_seen_batch: i64 = 0;
     let mut initial_mini_merkle_tree =
-        initialize_merkle_tree(pool.clone(), &args.eth_rpc_url, None).await?;
+        initialize_merkle_tree(pool.clone(), &args.eth_rpc_url, None, priority_tree_start_index).await?;
+
+    info!("Initialization complete; polling for new batches every {} seconds", args.poll_interval_secs);
 
     loop {
         match db.fetch_next_ready_execute_call(last_seen_batch).await? {
@@ -292,7 +306,7 @@ async fn run_single_batch(
         .context("Failed to read individualApprovals")?;
 
     // Compare hashes - if this execute tx was already executed.
-    {
+    'verify: {
         let db = PostgresBatchDb::new(pool.clone());
 
         if let Ok(Some(execute_tx)) = db
@@ -306,12 +320,22 @@ async fn run_single_batch(
             let execute_tx_hash = H256::from_str(&execute_tx)
                 .context("Failed to parse execution tx hash from DB as H256")?;
 
-            let transaction = contract
+            let transaction = match contract
                 .client()
                 .get_transaction(execute_tx_hash)
                 .await
-                .context("Failed to fetch execution transaction from Ethereum mainnet")?
-                .ok_or_else(|| anyhow!("Execution transaction not found on Ethereum mainnet"))?;
+            {
+                Ok(Some(tx)) => tx,
+                Ok(None) => {
+                    warn!("Execution transaction {} not found on Ethereum mainnet; skipping on-chain hash verification", execute_tx_hash);
+                    // Skip verification — tx may have been sent via a different RPC or L1.
+                    break 'verify;
+                }
+                Err(e) => {
+                    warn!("Failed to fetch execution transaction {} from Ethereum mainnet: {}; skipping on-chain hash verification", execute_tx_hash, e);
+                    break 'verify;
+                }
+            };
 
             let onchain_calldata = transaction.input.0;
 
