@@ -202,6 +202,19 @@ async fn main() -> Result<()> {
 
     // Running just a single batch manually (mostly for testing).
     if let Some(run_one_batch) = args.run_one_batch {
+        // Even in single-batch mode, verify the consistency checker has processed this batch.
+        let last_verified = db
+            .get_consistency_checker_last_verified_batch()
+            .await?
+            .unwrap_or(0);
+        if (run_one_batch as i64) > last_verified {
+            return Err(anyhow!(
+                "Batch {} has not been verified by the consistency checker yet (last verified: {}). \
+                 Refusing to approve.",
+                run_one_batch, last_verified
+            ));
+        }
+
         info!(batch=%run_one_batch, "Running single batch as requested; exiting after");
         let mut initial_mini_merkle_tree =
             initialize_merkle_tree(pool.clone(), &args.eth_rpc_url, Some(run_one_batch - 1), priority_tree_start_index)
