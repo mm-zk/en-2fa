@@ -134,9 +134,14 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // --- Ethereum mainnet provider + wallet (ALL contract calls go here) ---
-    let eth_provider = Provider::<Http>::try_from(args.eth_rpc_url.as_str())
-        .context("Failed to create provider (ETH_RPC_URL)")?
-        .interval(Duration::from_millis(200));
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("Failed to build HTTP client")?;
+    let rpc_url = url::Url::parse(&args.eth_rpc_url).context("Bad ETH_RPC_URL")?;
+    let http = ethers::providers::Http::new_with_client(rpc_url, http_client);
+    let eth_provider = Provider::new(http).interval(Duration::from_millis(200));
 
     // Get the calldata from SAMPLE_TX, and parse it as ExecuteBatches
 
